@@ -1,0 +1,176 @@
+BÀI THỰC HÀNH: PROMETHEUS FILE-BASED SERVICE DISCOVERY
+1. Mục tiêu
+- Tìm hiểu cơ chế File-based Service Discovery (file_sd_configs) trong Prometheus.
+- Thay thế cấu hình static_configs bằng cơ chế đọc danh sách targets từ file JSON.
+- Sử dụng file targets.json để quản lý danh sách các máy chủ cần giám sát.
+- Kiểm chứng khả năng tự động phát hiện targets khi danh sách trong file JSON thay đổi mà không cần reload hoặc restart Prometheus.
+2. Bối cảnh
+Trong hệ thống có nhiều microservice hoặc server cần giám sát, việc khai báo thủ công từng địa chỉ IP bằng static_configs sẽ gây bất tiện khi hệ thống mở rộng hoặc thay đổi.
+
+Ví dụ, cấu hình ban đầu theo đề bài:
+scrape_configs:
+  - job_name: 'microservices'
+    static_configs:
+      - targets: ['10.0.0.51:8080', '10.0.0.52:8080']
+
+Với cách cấu hình này, danh sách targets được khai báo trực tiếp trong prometheus.yml. Khi có server mới, người quản trị phải chỉnh sửa file cấu hình Prometheus.
+3. Nội dung thực hiện
+3.1. Thay thế static_configs bằng file_sd_configs
+Cấu hình ban đầu theo đề bài:
+scrape_configs:
+  - job_name: 'microservices'
+    static_configs:
+      - targets: ['10.0.0.51:8080', '10.0.0.52:8080']
+
+Cấu hình sau khi chỉnh sửa trong prometheus.yml:
+  - job_name: 'microservices'
+    file_sd_configs:
+      - files:
+          - 'targets.json'
+
+Như vậy, khối static_configs đã được thay thế bằng file_sd_configs.
+- file_sd_configs: Khai báo cơ chế phát hiện service dựa trên file.
+- files: Chỉ định đường dẫn đến file chứa danh sách targets.
+- targets.json: File JSON lưu địa chỉ IP và các nhãn tương ứng.
+Cấu hình hoàn chỉnh của prometheus.yml sau khi chỉnh sửa:
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'dummy-backend'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['dummy-backend:8080']
+
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  - job_name: 'microservices'
+    file_sd_configs:
+      - files:
+          - 'targets.json'
+
+Các job Prometheus, dummy-backend và node được giữ nguyên. Chỉ job microservices được chuyển sang cơ chế File-based Service Discovery.
+3.2. Tạo file targets.json
+Tạo file targets.json trong thư mục dự án /home/deploy/prometheus với nội dung:
+[
+  {
+    "targets": [
+      "10.0.0.51:8080",
+      "10.0.0.52:8080"
+    ],
+    "labels": {
+      "env": "production"
+    }
+  }
+]
+
+Ý nghĩa:
+Thành phần	Chức năng
+targets	Danh sách địa chỉ IP và port của các server cần giám sát
+labels	Khai báo nhãn bổ sung cho nhóm targets
+env	Tên nhãn thể hiện môi trường triển khai
+production	Giá trị của nhãn, biểu thị môi trường production
+
+
+Cả hai targets đều được gán chung nhãn env: production.
+3.3. Cấu hình Docker Compose
+Do Prometheus chạy trong Docker container, cần mount file targets.json từ máy chủ EC2 vào container để Prometheus có thể đọc được.
+
+Bổ sung volume sau vào service prometheus trong file compose.yaml:
+volumes:
+  - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  - ./alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+  - ./targets.json:/etc/prometheus/targets.json:ro
+  - prometheus_data:/prometheus
+
+Trong đó:
+- ./targets.json: File JSON trên máy chủ EC2.
+- /etc/prometheus/targets.json: Đường dẫn file tương ứng bên trong container.
+- :ro: Mount ở chế độ chỉ đọc, tránh việc container sửa đổi file trên host.
+Sau khi chỉnh sửa, kiểm tra cấu hình Docker Compose:
+sudo docker compose config -q
+
+Kết quả: Không xuất hiện lỗi, cấu hình Compose hợp lệ.
+3.4. Khởi động lại service Prometheus
+Áp dụng cấu hình mới bằng lệnh:
+sudo docker compose up -d prometheus
+
+Kiểm tra trạng thái container:
+sudo docker compose ps prometheus
+
+Kết quả:
+NAME         IMAGE                    COMMAND                  SERVICE      CREATED         STATUS         PORTS
+prometheus   prom/prometheus:latest   "/bin/prometheus --c…"   prometheus   7 seconds ago   Up 6 seconds   127.0.0.1:9090->9090/tcp
+
+Container Prometheus đã khởi động thành công.
+3.5. Kiểm tra file JSON bên trong container
+Sử dụng lệnh:
+sudo docker exec prometheus cat /etc/prometheus/targets.json
+
+Kết quả trả về đúng nội dung file JSON đã tạo trên máy chủ EC2.
+
+Điều này xác nhận file targets.json đã được mount thành công vào container Prometheus.
+4. Kiểm tra kết quả
+Sử dụng Prometheus HTTP API để kiểm tra danh sách targets đang được quản lý:
+sudo docker exec prometheus wget -qO- http://localhost:9090/api/v1/targets
+
+Kết quả trả về có trạng thái:
+{
+  "status": "success"
+}
+
+Trong danh sách activeTargets, xuất hiện hai targets thuộc job microservices:
+Target	Job	Label	Health
+10.0.0.51:8080	microservices	env=production	DOWN
+10.0.0.52:8080	microservices	env=production	DOWN
+
+
+Một số thông tin quan trọng trong kết quả API:
+- scrapePool: microservices: Prometheus đã tạo scrape pool cho job tương ứng.
+- __meta_filepath: /etc/prometheus/targets.json: Xác nhận targets được phát hiện từ file JSON.
+- env: production: Nhãn đã được áp dụng chính xác.
+- droppedTargets: []: Không có targets nào bị loại bỏ.
+Phân tích trạng thái DOWN
+Hai targets có trạng thái DOWN, với thông báo lỗi:
+context deadline exceeded
+
+Nguyên nhân là Prometheus không nhận được phản hồi từ hai địa chỉ IP trong thời gian chờ scrape 10 giây.
+
+Đây là hai địa chỉ IP minh họa trong đề bài, không phải các server đang hoạt động thực tế. Vì vậy, trạng thái DOWN không đồng nghĩa với việc cấu hình File-based Service Discovery bị lỗi.
+
+Điều quan trọng là cả hai targets đã xuất hiện trong danh sách activeTargets và được gán đúng nhãn env=production.
+
+Các job còn lại vẫn hoạt động bình thường:
+Job	Health
+prometheus	UP
+dummy-backend	UP
+node	UP
+microservices	DOWN (do IP minh họa không phản hồi)
+
+
+5. Kết quả đạt được
+Sau khi hoàn thành bài thực hành:
+- Đã thay thế static_configs bằng file_sd_configs cho job microservices.
+- Đã cấu hình Prometheus đọc danh sách targets từ targets.json.
+- Đã tạo file JSON chứa hai địa chỉ IP 10.0.0.51:8080 và 10.0.0.52:8080.
+- Đã gán chung nhãn env: production cho hai targets.
+- Đã cấu hình Docker Compose mount file JSON vào Prometheus container.
+- Đã xác nhận Prometheus phát hiện thành công cả hai targets thông qua HTTP API.
+6. Kết luận
+Thông qua bài thực hành, đã tìm hiểu và triển khai thành công cơ chế File-based Service Discovery trong Prometheus.
+
+So với việc khai báo trực tiếp danh sách targets bằng static_configs, file_sd_configs giúp tách danh sách server cần giám sát ra khỏi file cấu hình chính prometheus.yml. Nhờ đó, khi có server mới hoặc cần thay đổi địa chỉ server, người quản trị chỉ cần cập nhật file targets.json mà không cần reload hoặc restart Prometheus.
+
+Cơ chế này giúp việc quản lý targets linh hoạt hơn, đặc biệt trong môi trường microservices có số lượng server thường xuyên thay đổi.
+
+Lưu ý kỹ thuật: Prometheus mặc định kiểm tra thay đổi file discovery theo chu kỳ 5 phút. Vì vậy, việc tự phát hiện không nhất thiết diễn ra ngay lập tức. Ngoài ra, bài thực hành đã xác nhận khả năng phát hiện targets, chưa kiểm chứng việc thêm một server mới rồi quan sát Prometheus tự cập nhật danh sách mà không restart.
